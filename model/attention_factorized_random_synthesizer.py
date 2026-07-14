@@ -1,0 +1,82 @@
+import torch
+import torch.nn as nn
+
+class AttentionFactorizedRandomSynthesizer(nn.Module):
+    def __init__(self, d_model, head_dim, num_heads, max_seq_len=128, rank=8, mask=False, dropout=0.1):
+        super().__init__()
+
+        assert head_dim * num_heads == d_model, "head_dim * num_heads deve ser igual a d_model"
+
+        self.d_model = d_model
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.max_seq_len = max_seq_len
+        self.rank = rank
+        self.mask = mask
+
+        self.R1 = nn.Parameter(torch.randn(num_heads, max_seq_len, rank) * 0.02)
+        self.R2 = nn.Parameter(torch.randn(num_heads, max_seq_len, rank) * 0.02)
+
+        self.value = nn.Linear(d_model, d_model, bias=False)
+        self.proj_out = nn.Linear(d_model, d_model)
+
+        self.softmax = nn.Softmax(dim=-1)
+
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+
+    def forward(self, x_q, x_kv=None, key_padding_mask=None):
+        if x_kv is None:
+            x_kv = x_q
+
+        batch_size, seq_len_q, _ = x_q.size()
+        _, seq_len_kv, _ = x_kv.size()
+
+        r1 = self.R1[:, :seq_len_q, :]                         # [H, T, rank]
+        r2 = self.R2[:, :seq_len_kv, :]                        # [H, S, rank]
+        attn_scores = r1 @ r2.transpose(-2, -1)               # [H, T, S]
+        attn_scores = attn_scores.unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+        if self.mask:
+            mask = torch.triu(
+                torch.ones(seq_len_q, seq_len_kv, device=x_q.device),
+                diagonal=1
+            ).bool()
+            attn_scores = attn_scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        # Máscara de padding — ignora tokens <pad> nas keys
+        if key_padding_mask is not None:
+            attn_scores = attn_scores.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf")
+            )
+
+        attn_weights = self.softmax(attn_scores)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        v = self.value(x_kv).view(batch_size, seq_len_kv, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_output = attn_weights @ v
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len_q, self.d_model)
+
+        output = self.proj_out(attn_output)
+        output = self.proj_dropout(output)
+
+        return output
+    
+"""
+Transformer com Factorized Random Synthesizer
+=============================================
+O cálculo dos scores de atenção:
+    PADRÃO             :  scores = (X·Wq) · (X·Wk)ᵀ / √d     ← depende do input
+    RANDOM             :  scores = R        ∈ R^(N×N)          ← parâmetro global fixo
+    FACTORIZED RANDOM  :  scores = R1 · R2ᵀ                   ← low-rank, global
+
+Onde:
+    R1, R2 ∈ R^(N×k)  são parâmetros treináveis independentes do input (k << N)
+    Os mesmos scores são aplicados a todas as amostras do batch
+
+Propriedade única:
+    - Não há Wq nem Wk
+    - O padrão de atenção é único e global para toda a tarefa
+    - Funciona como uma "atenção estrutural" aprendida — ex: dependências posicionais recorrentes
+"""
